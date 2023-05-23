@@ -14,7 +14,8 @@ use fadroma::{
     bin_serde::{FadromaSerialize, FadromaDeserialize},
     storage::{SingleItem, TypedKey, map::InsertOnlyMap},
     core::{ContractCode, ContractLink, Humanize, Canonize},
-    admin,
+    admin::{self, Admin},
+    killswitch::{self, Killswitch},
     namespace
 };
 use serde::{Serialize, Deserialize, de::DeserializeOwned};
@@ -32,17 +33,22 @@ pub struct InstantiateMsg {
     pub code: ContractCode
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
+#[derive(Serialize, Deserialize, JsonSchema, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecuteMsg<MSG> {
-    CreateInstance(InstanceConfig<MSG>)
+    CreateInstance(InstanceConfig<MSG>),
+    ChangeContractCode(ContractCode),
+    Admin(admin::ExecuteMsg),
+    Killswitch(killswitch::ExecuteMsg)
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
+#[derive(Serialize, Deserialize, JsonSchema, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMsg {
     ListInstances { pagination: Pagination },
-    InstanceByAddr { addr: String }
+    InstanceByAddr { addr: String },
+    Admin(admin::QueryMsg),
+    Killswitch(killswitch::QueryMsg)
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug)]
@@ -122,15 +128,39 @@ impl<
         info: MessageInfo,
         msg: ExecuteMsg<MSG>
     ) -> StdResult<Response> {
+        if !matches!(msg, ExecuteMsg::Killswitch(_)) {
+            killswitch::assert_is_operational(deps.as_ref())?;
+        }
+
         match msg {
             ExecuteMsg::CreateInstance(config) =>
-                Self::create_instance(deps, env, info, config)
+                Self::create_instance(deps, env, info, config),
+            ExecuteMsg::ChangeContractCode(code) =>
+                Self::change_contract_code(deps, info, &code),
+            ExecuteMsg::Admin(msg) => match msg {
+                admin::ExecuteMsg::ChangeAdmin { mode } =>
+                    admin::DefaultImpl::change_admin(
+                        deps,
+                        env,
+                        info,
+                        mode
+                    )
+            }
+            ExecuteMsg::Killswitch(msg) => match msg {
+                killswitch::ExecuteMsg::SetStatus { status } =>
+                    killswitch::DefaultImpl::set_status(
+                        deps,
+                        env,
+                        info,
+                        status
+                    )
+            }
         }
     }
 
     pub fn query(
         deps: Deps,
-        _env: Env,
+        env: Env,
         msg: QueryMsg
     ) -> StdResult<Binary> {
         match msg {
@@ -143,6 +173,20 @@ impl<
                 let result = Self::instance_by_addr(deps, addr)?;
 
                 to_binary(&result)
+            }
+            QueryMsg::Admin(msg) => match msg {
+                admin::QueryMsg::Admin { } => {
+                    let admin = admin::DefaultImpl::admin(deps, env)?;
+    
+                    to_binary(&admin)
+                }
+            }
+            QueryMsg::Killswitch(msg) => match msg {
+                killswitch::QueryMsg::Status { } => {
+                    let result = killswitch::DefaultImpl::status(deps, env)?;
+    
+                    to_binary(&result)
+                }
             }
         }
     }
@@ -236,6 +280,17 @@ impl<
         );
     
         Ok(Response::default().add_submessage(msg))
+    }
+
+    #[admin::require_admin]
+    pub fn change_contract_code(
+        deps: DepsMut,
+        info: MessageInfo,
+        code: &ContractCode
+    ) -> StdResult<Response> {
+        CONTRACT.save(deps.storage, code)?;
+
+        Ok(Response::default())
     }
 
     pub fn list_instances(deps: Deps, pagination: Pagination) ->
@@ -590,6 +645,35 @@ mod tests {
             assert_eq!(instance.contract.code_hash, "test_contract_0");
             assert_eq!(instance.extra, format!("extra data {}", i as u8 + (num_instances / 2)));
         }
+    }
+
+    #[test]
+    fn only_admin_can_change_contract_code() {
+        let Suite { mut ensemble, factory } = Suite::new::<false>();
+        let err = ensemble.execute(
+            &ExecuteMsg::<ChildInstantiateMsg>::ChangeContractCode(
+                ContractCode {
+                    id: 2,
+                    code_hash: "code_hash".into()
+                }
+            ),
+            MockEnv::new("not admin", &factory.address)
+        ).unwrap_err();
+
+        assert_eq!(
+            err.unwrap_contract_error().to_string(),
+            "Generic error: Unauthorized"
+        );
+
+        ensemble.execute(
+            &ExecuteMsg::<ChildInstantiateMsg>::ChangeContractCode(
+                ContractCode {
+                    id: 2,
+                    code_hash: "code_hash".into()
+                }
+            ),
+            MockEnv::new(ADMIN, factory.address)
+        ).unwrap();
     }
 
     fn extract_instance_addr(resp: &ExecuteResponse) -> String {
